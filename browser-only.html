@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Audio Continue — Browser-only (no server)</title>
+  <style>
+    body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:1rem;padding:0;color:#111}
+    .wrap{max-width:720px;margin:0 auto}
+    input,button,select,textarea{font-size:1rem;padding:.5rem;margin:.3rem 0;width:100%}
+    .row{display:flex;gap:.5rem}
+    .row> *{flex:1}
+    audio{width:100%;margin-top:.5rem}
+    pre{background:#f7f7f7;padding:.5rem;overflow:auto}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Audio Continue — Browser-only demo</h1>
+    <p>This runs entirely in your browser — no server or Termux needed. It will:</p>
+    <ul>
+      <li>Load an MP3/MP4/ WAV file from your phone.</li>
+      <li>Extract the last few seconds as a "seed".</li>
+      <li>Loop and pitch-shift the seed to create an extended audio clip.</li>
+      <li>Let you download the resulting WAV file.</li>
+    </ul>
+    <p>Notes: This demo does not embed a synthesized voice continuation into the downloadable file because browser TTS can't be captured reliably across mobile browsers. You can use the built-in Speak button to hear a continuation live, or record the output with a screen/audio recorder if you need a file.</p>
+
+    <label>Choose audio file (MP3/MP4/WAV):</label>
+    <input id="file" type="file" accept="audio/*,video/*" />
+
+    <label>Seed length (seconds):</label>
+    <input id="seedSec" type="number" value="3" min="1" max="10" />
+
+    <label>Output length (seconds):</label>
+    <input id="outSec" type="number" value="10" min="3" max="60" />
+
+    <label>Pitch shift (semitones, positive raises pitch):</label>
+    <input id="semitones" type="number" value="0.6" step="0.1" />
+
+    <div style="display:flex;gap:.5rem;margin-top:.5rem">
+      <button id="process">Process & Create Download</button>
+      <button id="play" disabled>Play Result</button>
+    </div>
+
+    <div style="margin-top:1rem">
+      <strong>Live TTS continuation (plays in browser, not included in download):</strong>
+      <textarea id="contText" rows="2">And it keeps going, the melody continues and the chorus comes back.</textarea>
+      <div style="display:flex;gap:.5rem;margin-top:.5rem">
+        <button id="speak">Speak Continuation</button>
+        <button id="stopSpeak">Stop</button>
+      </div>
+    </div>
+
+    <div id="status" style="margin-top:1rem;color:#444"></div>
+    <div id="links" style="margin-top:1rem"></div>
+    <audio id="player" controls></audio>
+
+    <h3>How to use</h3>
+    <ol>
+      <li>Tap Choose file and pick the audio clip on your phone (3–15s recommended).</li>
+      <li>Adjust seed length and output length, then Process.</li>
+      <li>When finished, use the Download link to save the WAV to your phone.</li>
+      <li>To hear a spoken continuation in the browser, edit the text and press Speak.</li>
+    </ol>
+
+    <p style="color:#a33"><strong>Legal:</strong> Do not use this to impersonate or abuse others. You confirmed consent for any voices used.</p>
+
+    <pre id="log" style="height:120px"></pre>
+  </div>
+
+<script>
+// Browser-only audio processing app
+const fileEl = document.getElementById('file');
+const seedSecEl = document.getElementById('seedSec');
+const outSecEl = document.getElementById('outSec');
+const semitonesEl = document.getElementById('semitones');
+const processBtn = document.getElementById('process');
+const statusEl = document.getElementById('status');
+const logEl = document.getElementById('log');
+const linksEl = document.getElementById('links');
+const player = document.getElementById('player');
+const playBtn = document.getElementById('play');
+const speakBtn = document.getElementById('speak');
+const stopSpeakBtn = document.getElementById('stopSpeak');
+const contText = document.getElementById('contText');
+
+let resultBuffer = null;
+
+function log(msg){
+  console.log(msg);
+  logEl.textContent += msg + '\n';
+}
+
+function setStatus(s){ statusEl.textContent = s; log(s); }
+
+// Utility: convert AudioBuffer to WAV blob
+function audioBufferToWav(abuffer){
+  const numOfChan = abuffer.numberOfChannels,
+        length = abuffer.length * numOfChan * 2 + 44,
+        buffer = new ArrayBuffer(length),
+        view = new DataView(buffer),
+        channels = [],
+        sampleRate = abuffer.sampleRate;
+
+  let offset = 0;
+  function writeString(view, offset, string){
+    for (let i = 0; i < string.length; i++){
+      view.setUint8(offset + i, string.charCodeAt(i));
+    }
+  }
+  writeString(view, 0, 'RIFF');
+  view.setUint32(4, 36 + abuffer.length * numOfChan * 2, true);
+  writeString(view, 8, 'WAVE');
+  writeString(view, 12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, numOfChan, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * numOfChan * 2, true);
+  view.setUint16(32, numOfChan * 2, true);
+  view.setUint16(34, 16, true);
+  writeString(view, 36, 'data');
+  view.setUint32(40, abuffer.length * numOfChan * 2, true);
+  offset = 44;
+
+  for (let i = 0; i < numOfChan; i++)
+    channels.push(abuffer.getChannelData(i));
+
+  for (let i = 0; i < abuffer.length; i++){
+    for (let ch = 0; ch < numOfChan; ch++){
+      let sample = Math.max(-1, Math.min(1, channels[ch][i]));
+      view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7FFF, true);
+      offset += 2;
+    }
+  }
+
+  return new Blob([buffer], { type: 'audio/wav' });
+}
+
+async function decodeFile(file){
+  const arrayBuffer = await file.arrayBuffer();
+  const ac = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(1,1,44100);
+  // use a temporary AudioContext to decode
+  const actx = new (window.AudioContext || window.webkitAudioContext)();
+  const audioBuffer = await actx.decodeAudioData(arrayBuffer.slice(0));
+  actx.close && actx.close();
+  return audioBuffer;
+}
+
+// Render pitched buffer into new buffer at same length using OfflineAudioContext
+async function renderPitchedBuffer(srcBuffer, semitoneShift, targetLengthSeconds){
+  const sampleRate = srcBuffer.sampleRate || 44100;
+  const targetLength = Math.round(targetLengthSeconds * sampleRate);
+  const offline = new (window.OfflineAudioContext || window.webkitOfflineAudioContext)(1, targetLength, sampleRate);
+
+  const src = offline.createBufferSource();
+  // create single-channel buffer with data from srcBuffer (mix down if necessary)
+  const tmp = offline.createBuffer(1, srcBuffer.length, sampleRate);
+  const srcData = srcBuffer.numberOfChannels > 1 ? mixDown(srcBuffer) : srcBuffer.getChannelData(0);
+  tmp.copyToChannel(srcData, 0);
+  src.buffer = tmp;
+
+  const rate = Math.pow(2, semitoneShift/12);
+  src.playbackRate.value = rate;
+
+  // If we change playbackRate, playback duration changes. We'll start at time 0, but set buffer to loop to fill duration
+  src.loop = true;
+  src.connect(offline.destination);
+  src.start(0);
+
+  const rendered = await offline.startRendering();
+  return rendered;
+}
+
+function mixDown(audioBuffer){
+  const len = audioBuffer.length;
+  const out = new Float32Array(len);
+  for (let c=0;c<audioBuffer.numberOfChannels;c++){
+    const ch = audioBuffer.getChannelData(c);
+    for (let i=0;i<len;i++) out[i] += ch[i];
+  }
+  for (let i=0;i<len;i++) out[i] /= audioBuffer.numberOfChannels;
+  return out;
+}
+
+processBtn.addEventListener('click', async ()=>{
+  const file = fileEl.files[0];
+  if(!file){ alert('Choose a file first'); return; }
+  setStatus('Decoding file...');
+  try{
+    const buf = await decodeFile(file);
+    setStatus('File decoded. Preparing seed...');
+    const seedSec = Number(seedSecEl.value) || 3;
+    const outSec = Number(outSecEl.value) || 10;
+    const semitones = Number(semitonesEl.value) || 0.6;
+
+    // extract last seedSec seconds
+    const sampleRate = buf.sampleRate;
+    const seedLen = Math.min(buf.length, Math.round(seedSec * sampleRate));
+    const start = Math.max(0, buf.length - seedLen);
+
+    // create seedBuffer single-channel
+    const seedBuf = (function(){
+      const sb = new (window.AudioContext || window.webkitAudioContext)().createBuffer(1, seedLen, sampleRate);
+      const channelData = buf.numberOfChannels > 1 ? mixDown(buf).slice(start) : buf.getChannelData(0).slice(start);
+      sb.copyToChannel(channelData, 0);
+      return sb;
+    })();
+
+    setStatus('Rendering pitched loop (this may take a few seconds)...');
+    const rendered = await renderPitchedBuffer(seedBuf, semitones, outSec);
+    resultBuffer = rendered;
+
+    setStatus('Rendering complete — preparing download link');
+    const wavBlob = audioBufferToWav(resultBuffer);
+    const url = URL.createObjectURL(wavBlob);
+    linksEl.innerHTML = `<a id="dl" href="${url}" download="audio_continue_result.wav">Download WAV</a>`;
+    player.src = url;
+    playBtn.disabled = false;
+    setStatus('Ready — you can play or download the result.');
+  }catch(err){
+    setStatus('Error: ' + err.message);
+    log(err.stack || err);
+  }
+});
+
+playBtn.addEventListener('click', ()=>{
+  if(player.src) player.play();
+});
+
+// TTS using browser SpeechSynthesis (plays live, not saved)
+speakBtn.addEventListener('click', ()=>{
+  const text = contText.value || '';
+  if(!('speechSynthesis' in window)){ alert('TTS not supported in this browser'); return; }
+  const utter = new SpeechSynthesisUtterance(text);
+  window._synthUtter = utter;
+  window.speechSynthesis.speak(utter);
+});
+stopSpeakBtn.addEventListener('click', ()=>{
+  if(window.speechSynthesis){ window.speechSynthesis.cancel(); }
+});
+
+</script>
+</body>
+</html>
